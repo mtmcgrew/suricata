@@ -362,11 +362,16 @@ static void *DetectEngineLiveRuleSwap(void *arg)
 {
     SCEnter();
 
+    int i = 0;
+    int no_of_detect_tvs = 0;
+    DetectEngineCtx *old_de_ctx = NULL;
+    ThreadVars *tv = NULL;
+
     if (SCSetThreadName("LiveRuleSwap") < 0) {
         SCLogWarning(SC_ERR_THREAD_INIT, "Unable to set thread name");
     }
 
-    SCLogInfo("===== Starting live rule swap triggered by user signal USR2 =====");
+    SCLogNotice("rule reload starting");
 
     ThreadVars *tv_local = (ThreadVars *)arg;
 
@@ -408,7 +413,51 @@ static void *DetectEngineLiveRuleSwap(void *arg)
     ConfDump();
 #endif
 
+    SCMutexLock(&tv_root_lock);
+
+    tv = tv_root[TVT_PPT];
+    while (tv) {
+        /* obtain the slots for this TV */
+        TmSlot *slots = tv->tm_slots;
+        while (slots != NULL) {
+            TmModule *tm = TmModuleGetById(slots->tm_id);
+
+            if (suricata_ctl_flags != 0) {
+                TmThreadsSetFlag(tv_local, THV_CLOSED);
+
+                SCLogInfo("rule reload interupted by engine shutdown");
+
+                UtilSignalHandlerSetup(SIGUSR2, SignalHandlerSigusr2);
+                SCMutexUnlock(&tv_root_lock);
+                pthread_exit(NULL);
+            }
+
+            if (!(tm->flags & TM_FLAG_DETECT_TM)) {
+                slots = slots->slot_next;
+                continue;
+            }
+            no_of_detect_tvs++;
+            break;
+        }
+
+        tv = tv->next;
+    }
+
+    DetectEngineThreadCtx *old_det_ctx[no_of_detect_tvs];
+    DetectEngineThreadCtx *new_det_ctx[no_of_detect_tvs];
+    ThreadVars *detect_tvs[no_of_detect_tvs];
+    memset(old_det_ctx, 0x00, (no_of_detect_tvs * sizeof(DetectEngineThreadCtx *)));
+    memset(new_det_ctx, 0x00, (no_of_detect_tvs * sizeof(DetectEngineThreadCtx *)));
+    memset(detect_tvs, 0x00, (no_of_detect_tvs * sizeof(ThreadVars *)));
+
+    SCMutexUnlock(&tv_root_lock);
+
     DetectEngineCtx *de_ctx = DetectEngineCtxInit();
+    if (de_ctx == NULL) {
+        SCLogError(SC_ERR_LIVE_RULE_SWAP, "Allocation failure in live "
+                   "swap.  Let's get out of here.");
+        goto error;
+    }
 
     SCClassConfLoadClassficationConfigFile(de_ctx);
     SCRConfLoadReferenceConfigFile(de_ctx);
@@ -421,6 +470,13 @@ static void *DetectEngineLiveRuleSwap(void *arg)
         SCLogError(SC_ERR_NO_RULES_LOADED, "Loading signatures failed.");
         if (de_ctx->failure_fatal)
             exit(EXIT_FAILURE);
+        DetectEngineCtxFree(de_ctx);
+        SCLogError(SC_ERR_LIVE_RULE_SWAP,  "Failure encountered while "
+                   "loading new ruleset with live swap.");
+        SCLogError(SC_ERR_LIVE_RULE_SWAP, "rule reload failed");
+        TmThreadsSetFlag(tv_local, THV_CLOSED);
+        UtilSignalHandlerSetup(SIGUSR2, SignalHandlerSigusr2);
+        pthread_exit(NULL);
     }
 
     SCThresholdConfInitContext(de_ctx, NULL);
@@ -429,8 +485,8 @@ static void *DetectEngineLiveRuleSwap(void *arg)
 
     SCMutexLock(&tv_root_lock);
 
-    int no_of_detect_tvs = 0;
-    ThreadVars *tv = tv_root[TVT_PPT];
+    /* all receive threads are part of packet processing threads */
+    tv = tv_root[TVT_PPT];
     while (tv) {
         /* obtain the slots for this TV */
         TmSlot *slots = tv->tm_slots;
@@ -440,8 +496,7 @@ static void *DetectEngineLiveRuleSwap(void *arg)
             if (suricata_ctl_flags != 0) {
                 TmThreadsSetFlag(tv_local, THV_CLOSED);
 
-                SCLogInfo("===== Live rule swap premature exit, since "
-                          "engine is in shutdown phase =====");
+                SCLogInfo("rule reload interupted by engine shutdown");
 
                 UtilSignalHandlerSetup(SIGUSR2, SignalHandlerSigusr2);
                 SCMutexUnlock(&tv_root_lock);
@@ -453,51 +508,50 @@ static void *DetectEngineLiveRuleSwap(void *arg)
                 continue;
             }
 
-            no_of_detect_tvs++;
-
-            slots = slots->slot_next;
+            old_det_ctx[i] = SC_ATOMIC_GET(slots->slot_data);
+            detect_tvs[i] = tv;
+            TmEcode r = DetectEngineThreadCtxInitForLiveRuleSwap(tv, (void *)de_ctx,
+                                                                 (void **)&new_det_ctx[i]);
+            i++;
+            if (r == TM_ECODE_FAILED) {
+                SCLogError(SC_ERR_LIVE_RULE_SWAP, "Detect engine thread init "
+                           "failure in live rule swap.  Let's get out of here");
+                SCMutexUnlock(&tv_root_lock);
+                goto error;
+            }
+            SCLogDebug("live rule swap created new det_ctx - %p and de_ctx "
+                       "- %p\n", new_det_ctx, de_ctx);
+            break;
         }
 
         tv = tv->next;
     }
 
-    DetectEngineThreadCtx *old_det_ctx[no_of_detect_tvs];
-    DetectEngineThreadCtx *new_det_ctx[no_of_detect_tvs];
-    ThreadVars *detect_tvs[no_of_detect_tvs];
-
-    /* all receive threads are part of packet processing threads */
+    i = 0;
     tv = tv_root[TVT_PPT];
-    int i = 0;
     while (tv) {
-        /* obtain the slots for this TV */
         TmSlot *slots = tv->tm_slots;
         while (slots != NULL) {
-            TmModule *tm = TmModuleGetById(slots->tm_id);
+            if (suricata_ctl_flags != 0) {
+                TmThreadsSetFlag(tv_local, THV_CLOSED);
 
+                SCLogInfo("rule reload interupted by engine shutdown");
+
+                UtilSignalHandlerSetup(SIGUSR2, SignalHandlerSigusr2);
+                SCMutexUnlock(&tv_root_lock);
+                pthread_exit(NULL);
+            }
+
+            TmModule *tm = TmModuleGetById(slots->tm_id);
             if (!(tm->flags & TM_FLAG_DETECT_TM)) {
                 slots = slots->slot_next;
                 continue;
             }
-
-            old_det_ctx[i] = SC_ATOMIC_GET(slots->slot_data);
-            detect_tvs[i] = tv;
-
-            DetectEngineThreadCtx *det_ctx = NULL;
-            DetectEngineThreadCtxInitForLiveRuleSwap(tv, (void *)de_ctx,
-                                                     (void **)&det_ctx);
-            SCLogDebug("live rule swap done with new det_ctx - %p and de_ctx "
-                       "- %p\n", det_ctx, de_ctx);
-
-            new_det_ctx[i] = det_ctx;
-            i++;
-
-            SCLogDebug("swapping new det_ctx - %p with older one - %p", det_ctx,
-                       SC_ATOMIC_GET(slots->slot_data));
-            (void)SC_ATOMIC_SET(slots->slot_data, det_ctx);
-
-            slots = slots->slot_next;
+            SCLogDebug("swapping new det_ctx - %p with older one - %p",
+                       new_det_ctx[i], SC_ATOMIC_GET(slots->slot_data));
+            (void)SC_ATOMIC_SET(slots->slot_data, new_det_ctx[i++]);
+            break;
         }
-
         tv = tv->next;
     }
 
@@ -568,7 +622,7 @@ static void *DetectEngineLiveRuleSwap(void *arg)
     }
 
     /* free all the ctxs */
-    DetectEngineCtx *old_de_ctx = old_det_ctx[0]->de_ctx;
+    old_de_ctx = old_det_ctx[0]->de_ctx;
     for (i = 0; i < no_of_detect_tvs; i++) {
         SCLogDebug("Freeing old_det_ctx - %p used by detect",
                    old_det_ctx[i]);
@@ -583,10 +637,44 @@ static void *DetectEngineLiveRuleSwap(void *arg)
 
     TmThreadsSetFlag(tv_local, THV_CLOSED);
 
-    SCLogInfo("===== Live rule swap DONE =====");
+    SCLogNotice("rule reload complete");
 
     pthread_exit(NULL);
-    return NULL;
+
+ error:
+    for (i = 0; i < no_of_detect_tvs; i++) {
+        if (new_det_ctx[i] != NULL)
+            DetectEngineThreadCtxDeinit(NULL, new_det_ctx[i]);
+    }
+    DetectEngineCtxFree(de_ctx);
+    TmThreadsSetFlag(tv_local, THV_CLOSED);
+    UtilSignalHandlerSetup(SIGUSR2, SignalHandlerSigusr2);
+    SCLogInfo("===== Live rule swap FAILURE =====");
+    pthread_exit(NULL);
+}
+
+void DetectEngineSpawnLiveRuleSwapMgmtThread(void)
+{
+    SCEnter();
+
+    SCLogDebug("Spawning mgmt thread for live rule swap");
+
+    ThreadVars *tv = TmThreadCreateMgmtThread("DetectEngineLiveRuleSwap",
+                                              DetectEngineLiveRuleSwap, 0);
+    if (tv == NULL) {
+        SCLogError(SC_ERR_THREAD_CREATE, "Live rule swap thread spawn failed");
+        exit(EXIT_FAILURE);
+    }
+
+    TmThreadSetCPU(tv, MANAGEMENT_CPU_SET);
+
+    if (TmThreadSpawn(tv) != 0) {
+        SCLogError(SC_ERR_THREAD_SPAWN, "TmThreadSpawn failed for "
+                   "DetectEngineLiveRuleSwap");
+        exit(EXIT_FAILURE);
+    }
+
+    SCReturn;
 }
 
 void DetectEngineSpawnLiveRuleSwapMgmtThread(void)
@@ -1173,6 +1261,8 @@ TmEcode DetectEngineThreadCtxInit(ThreadVars *tv, void *initdata, void **data) {
  */
 static TmEcode DetectEngineThreadCtxInitForLiveRuleSwap(ThreadVars *tv, void *initdata, void **data)
 {
+    *data = NULL;
+
     DetectEngineCtx *de_ctx = (DetectEngineCtx *)initdata;
     if (de_ctx == NULL)
         return TM_ECODE_FAILED;
