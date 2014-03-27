@@ -677,30 +677,6 @@ void DetectEngineSpawnLiveRuleSwapMgmtThread(void)
     SCReturn;
 }
 
-void DetectEngineSpawnLiveRuleSwapMgmtThread(void)
-{
-    SCEnter();
-
-    SCLogDebug("Spawning mgmt thread for live rule swap");
-
-    ThreadVars *tv = TmThreadCreateMgmtThread("DetectEngineLiveRuleSwap",
-                                              DetectEngineLiveRuleSwap, 0);
-    if (tv == NULL) {
-        SCLogError(SC_ERR_THREAD_CREATE, "Live rule swap thread spawn failed");
-        exit(EXIT_FAILURE);
-    }
-
-    TmThreadSetCPU(tv, MANAGEMENT_CPU_SET);
-
-    if (TmThreadSpawn(tv) != 0) {
-        SCLogError(SC_ERR_THREAD_SPAWN, "TmThreadSpawn failed for "
-                   "DetectEngineLiveRuleSwap");
-        exit(EXIT_FAILURE);
-    }
-
-    SCReturn;
-}
-
 DetectEngineCtx *DetectEngineGetGlobalDeCtx(void)
 {
     DetectEngineCtx *de_ctx = NULL;
